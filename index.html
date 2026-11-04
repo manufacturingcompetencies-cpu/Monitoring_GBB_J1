@@ -911,6 +911,7 @@ window.EMBEDDED_SCHEDULE = []; // No embedded data on public hosting
   const nf = new Intl.NumberFormat('id-ID', { maximumFractionDigits: 3 });
   const nf3 = new Intl.NumberFormat('id-ID', { minimumFractionDigits: 0, maximumFractionDigits: 3 });
 
+  const SHARED_LOCAL_KEYS = new Set([STORAGE_KEY, WEIGHING_KEY, SESSION_KEY, MINPACK_KEY, FULLSTOCK_KEY, MASTER_KEY]);
   const state = {
     master: (() => {
       // Database bawaan dipakai, kecuali ada versi unggahan sendiri yang dibuat
@@ -955,11 +956,13 @@ window.EMBEDDED_SCHEDULE = []; // No embedded data on public hosting
   const settingsEls = ['movementType','plant','sourceSloc','receivingSloc','goodsRecipient','orderField'];
 
   function loadJson(key, fallback) {
+    if (SHARED_LOCAL_KEYS.has(key)) return fallback; // Shared data must never persist in an operator browser.
     try { return JSON.parse(localStorage.getItem(key)) ?? fallback; }
     catch { return fallback; }
   }
 
   function saveJson(key, value) {
+    if (SHARED_LOCAL_KEYS.has(key)) return true; // Stored centrally by authenticated RPC only.
     try { localStorage.setItem(key, JSON.stringify(value)); return true; }
     catch { return false; }
   }
@@ -2689,7 +2692,7 @@ window.EMBEDDED_SCHEDULE = []; // No embedded data on public hosting
     renderSchedule();
     renderTransit();
     renderSmbBuilder();
-    if (typeof scheduleAutosave === 'function') scheduleAutosave();
+    if (typeof scheduleAutosave === 'function' && !applyingRemote) scheduleAutosave();
   }
 
   function cloneEmbedded() {
@@ -3096,7 +3099,7 @@ window.EMBEDDED_SCHEDULE = []; // No embedded data on public hosting
     })();
     bindUpload('masterFile', importMaster);
     el('downloadWeighingTemplate').addEventListener('click', exportWeighingTemplate);
-    el('saveManual').addEventListener('click', () => alert(saveJson(STORAGE_KEY, state.manual) ? 'Input manual tersimpan di browser ini.' : 'Input tidak dapat disimpan pada browser ini.'));
+    el('saveManual').addEventListener('click', () => alert(saveJson(STORAGE_KEY, state.manual) ? 'Input manual dijadwalkan untuk disimpan ke Supabase.' : 'Tidak dapat memproses input.'));
     el('clearManual').addEventListener('click', () => { if (confirm('Kosongkan seluruh input stok aktual dan transit manual?')) { pushHistory('Kosongkan input stok manual'); state.manual = {}; saveJson(STORAGE_KEY, state.manual); render(); } });
     el('clearWeighing').addEventListener('click', () => { if (confirm('Kosongkan seluruh stok bin area timbang?')) { pushHistory('Kosongkan stok area timbang'); state.weighing = {}; state.weighingSourceName = 'Belum ada file area timbang'; saveJson(WEIGHING_KEY, state.weighing); updateWeighingState(); render(); } });
     el('reloadSample').addEventListener('click', () => { if (confirm('Muat ulang data contoh awal? Input stok manual yang tersimpan tetap dipertahankan.')) cloneEmbedded(); });
@@ -3300,7 +3303,7 @@ window.EMBEDDED_SCHEDULE = []; // No embedded data on public hosting
 
   /* ══════════════════════════════════════════
    * FITUR 1: Pengaturan Aplikasi (nama, logo, tema)
-   * FITUR 2: Autosave JSONBin.io
+   * FITUR 2: Autosave Supabase
    * ══════════════════════════════════════════ */
 
   const APP_SETTINGS_KEY = 'gudang-bb-app-settings-v1';
@@ -3345,7 +3348,8 @@ window.EMBEDDED_SCHEDULE = []; // No embedded data on public hosting
   }
 
   /* Multiuser Pilot backend: authenticated, optimistic concurrency with SQLite. */
-  let jsonbinCfg = {key:'pilot',bin:'pilot'}; // compatibility with the existing reset handler
+  let jsonbinCfg = {key:'pilot',bin:'pilot'}; // legacy reset-handler compatibility
+  let applyingRemote=false, loginReady=false, remoteRequestInFlight=false;
   let autosaveTimer=null, pollTimer=null, simpanTerakhir=0, adaPerubahanLokal=false;
   let remoteVersion=null, lastSavedSignature='', remoteConflict=false, syncing=false, remoteUser='';
   const POLL_MS=5000;
@@ -3380,10 +3384,9 @@ window.EMBEDDED_SCHEDULE = []; // No embedded data on public hosting
     if(obj.orderMeta && typeof obj.orderMeta==='object')state.orderMeta=obj.orderMeta;
     if(typeof obj.sourceName==='string')state.sourceName=obj.sourceName;
     if(typeof obj.weighingSourceName==='string')state.weighingSourceName=obj.weighingSourceName;
-    saveJson(STORAGE_KEY,state.manual);saveJson(WEIGHING_KEY,state.weighing);
-    saveJson(MINPACK_KEY,state.minPack);saveJson(FULLSTOCK_KEY,state.fullStock);
-    saveSession();
-    render();
+    state.undoStack=[];state.redoStack=[];updateHistoryControls();
+    applyingRemote=true;
+    try { render(); } finally { applyingRemote=false; }
   }
   async function getRemote(){
     const {data,error}=await z13Client.rpc('z13_read_workspace',{p_workspace_id:'gudang-bb-utama'});
@@ -3398,10 +3401,11 @@ window.EMBEDDED_SCHEDULE = []; // No embedded data on public hosting
       if(remoteVersion!==null && adaPerubahanLokal && !force){showConflict(remote);return;}
       remoteVersion=remote.version;
       if(remote.version===0 && !Object.keys(remote.data||{}).length){
-        // First launch: do NOT publish demo/example material automatically.
+        // Empty DB must never display stale data from a previous session.
+        applyShared({master:[],materials:[],manual:{},weighing:{},minPack:{},fullStock:{aktif:false,qty:{},sumber:'',waktu:''},session:{},selectedOrders:[],orderMeta:{},sourceName:'Belum ada data',weighingSourceName:'Belum ada stok timbang'});
         lastSavedSignature=signature(sharedPayload());
         setAutosaveStatus('ok','Database kosong · unggah data dummy terlebih dahulu');
-        return;
+        return true;
       }
       if(force)adaPerubahanLokal=false;
       applyShared(remote.data);
@@ -3409,7 +3413,8 @@ window.EMBEDDED_SCHEDULE = []; // No embedded data on public hosting
       adaPerubahanLokal=false;remoteConflict=false;
       const box=el('konflikBox');if(box)box.style.display='none';
       setAutosaveStatus('ok','Sinkron · v'+remoteVersion+' · '+(remote.savedBy||'operator'));
-    }catch(e){setAutosaveStatus('err','Gagal sinkron: '+e.message);}
+      return true;
+    }catch(e){setAutosaveStatus('err','Gagal sinkron: '+e.message);return false;}
   }
   function showConflict(remote){
     remoteConflict=true;clearTimeout(autosaveTimer);
@@ -3423,10 +3428,12 @@ window.EMBEDDED_SCHEDULE = []; // No embedded data on public hosting
     const actions=document.createElement('div');actions.className='konflik-aksi';
     const take=document.createElement('button');take.className='btn btn-primary btn-small';take.type='button';take.textContent='Buang perubahan lokal & ambil data terbaru';
     take.onclick=async()=>{if(confirm('Perubahan lokal yang belum disimpan akan hilang. Lanjut?'))await jsonbinLoad(true);};
-    actions.append(take);box.append(actions);
+    const backup=document.createElement('button');backup.className='btn btn-outline btn-small';backup.type='button';backup.textContent='Unduh perubahan lokal (JSON)';
+    backup.onclick=()=>{const blob=new Blob([JSON.stringify({timestamp:new Date().toISOString(),version:remoteVersion,payload:sharedPayload()},null,2)],{type:'application/json'});const u=URL.createObjectURL(blob);const a=document.createElement('a');a.href=u;a.download='z13-perubahan-belum-tersimpan.json';a.click();setTimeout(()=>URL.revokeObjectURL(u),3000);};
+    actions.append(backup,take);box.append(actions);
   }
   async function jsonbinSave(){
-    if(remoteVersion===null || remoteConflict || syncing)return;
+    if(!loginReady || remoteVersion===null || remoteConflict || syncing)return;
     const payload=sharedPayload(), sig=signature(payload);
     if(sig===lastSavedSignature){adaPerubahanLokal=false;return;}
     syncing=true;
@@ -3445,13 +3452,14 @@ window.EMBEDDED_SCHEDULE = []; // No embedded data on public hosting
     finally{syncing=false;if(adaPerubahanLokal && !remoteConflict)scheduleAutosave();}
   }
   function scheduleAutosave(){
-    if(remoteVersion===null || remoteConflict)return;
+    if(!loginReady || applyingRemote || remoteVersion===null || remoteConflict)return;
     const sig=signature(sharedPayload());if(sig===lastSavedSignature)return;
     adaPerubahanLokal=true;clearTimeout(autosaveTimer);
     autosaveTimer=setTimeout(jsonbinSave,1600);
   }
   async function jsonbinPoll(manual=false){
-    if(remoteVersion===null || remoteConflict || syncing)return;
+    if(!loginReady || remoteVersion===null || remoteConflict || syncing || remoteRequestInFlight)return;
+    remoteRequestInFlight=true;
     try{
       const remote=await getRemote();
       if(remote.version===remoteVersion){if(manual)setAutosaveStatus('ok','Sudah terbaru · v'+remoteVersion);return;}
@@ -3461,6 +3469,7 @@ window.EMBEDDED_SCHEDULE = []; // No embedded data on public hosting
       lastSavedSignature=signature(sharedPayload());
       setAutosaveStatus('ok','Update dari '+(remote.savedBy||'operator')+' · v'+remoteVersion);
     }catch(e){setAutosaveStatus('err','Offline / gagal sinkron: '+e.message);}
+    finally{remoteRequestInFlight=false;}
   }
   function mulaiPoll(){
     clearInterval(pollTimer);
@@ -3472,9 +3481,10 @@ window.EMBEDDED_SCHEDULE = []; // No embedded data on public hosting
     if(!z13Client){msg.textContent='Lengkapi config.js dengan Project URL dan Publishable Key terlebih dahulu.';return;}
     async function activate(user){
       remoteUser=user.email||user.id;
-      gate.hidden=true;logout.hidden=false;
-      remoteVersion=null;remoteConflict=false;adaPerubahanLokal=false;
-      await jsonbinLoad(true);mulaiPoll();
+      loginReady=false;remoteVersion=null;remoteConflict=false;adaPerubahanLokal=false;
+      const loaded=await jsonbinLoad(true);
+      if(!loaded){msg.textContent='Login berhasil, tetapi akses database gagal. Pastikan operator terdaftar pada z13_operator dan SQL revisi sudah dijalankan.';return;}
+      loginReady=true;gate.hidden=true;logout.hidden=false;mulaiPoll();
     }
     form.addEventListener('submit',async(e)=>{
       e.preventDefault();msg.textContent='';
@@ -3488,7 +3498,7 @@ window.EMBEDDED_SCHEDULE = []; // No embedded data on public hosting
     });
     logout.addEventListener('click',async()=>{
       if(adaPerubahanLokal && !confirm('Ada perubahan belum tersimpan. Tetap keluar?'))return;
-      clearInterval(pollTimer);clearTimeout(autosaveTimer);
+      loginReady=false;clearInterval(pollTimer);clearTimeout(autosaveTimer);
       await z13Client.auth.signOut();location.reload();
     });
     try{
@@ -3498,6 +3508,7 @@ window.EMBEDDED_SCHEDULE = []; // No embedded data on public hosting
     }catch(err){msg.textContent='Gagal memeriksa sesi: '+err.message;}
   }
 
+  window.addEventListener('beforeunload', e=>{ if(loginReady && adaPerubahanLokal){e.preventDefault();e.returnValue='';} });
   function namaPengguna(){return remoteUser||'operator';}
   function catatRequest(){return 0;}
   /* ─── Modal pengaturan ─── */
